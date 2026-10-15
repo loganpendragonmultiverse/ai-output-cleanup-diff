@@ -16,9 +16,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--exclude", action="append", default=[])
     parser.add_argument("--format", choices=("markdown", "json"), default="markdown")
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--max-file-bytes", type=int, help="maximum bytes per file; omitted means unlimited"
+    )
+    parser.add_argument(
+        "--max-total-bytes",
+        type=int,
+        help="combined read budget across before then after; omitted means unlimited",
+    )
     args = parser.parse_args(argv)
     try:
-        report = compare(args.before, args.after, args.exclude)
+        report = compare(
+            args.before,
+            args.after,
+            args.exclude,
+            max_file_bytes=args.max_file_bytes,
+            max_total_bytes=args.max_total_bytes,
+        )
         rendered = render_json(report) if args.format == "json" else render_markdown(report)
         if args.output:
             if args.output.exists():

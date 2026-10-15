@@ -3,6 +3,8 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import os
+import stat
 from collections import Counter
 from difflib import ndiff
 from pathlib import Path
@@ -24,18 +26,75 @@ def _hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _inventory(root: Path, excludes: list[str]) -> dict[str, bytes]:
-    if not root.is_dir():
-        raise ValueError(f"not a directory: {root}")
-    result = {}
-    for path in root.rglob("*"):
-        if not path.is_file() or path.is_symlink():
-            continue
-        relative = path.relative_to(root).as_posix()
-        if any(fnmatch.fnmatch(relative, pattern) for pattern in excludes):
-            continue
-        result[relative] = path.read_bytes()
-    return result
+def _inventory(
+    root: Path, excludes: list[str], per_file: int | None, budget: dict[str, Any]
+) -> tuple[dict[str, bytes], dict[str, str]]:
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"not a directory or symlink root: {root}")
+    result: dict[str, bytes] = {}
+    skipped: dict[str, str] = {}
+
+    def walk_error(error: OSError) -> None:
+        try:
+            relative = Path(error.filename or root).relative_to(root).as_posix()
+        except ValueError:
+            relative = "."
+        skipped[relative] = "unreadable-directory"
+
+    for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
+        dirs.sort()
+        files.sort()
+        for name in dirs.copy():
+            path = Path(directory) / name
+            relative = path.relative_to(root).as_posix()
+            if any(
+                fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(relative + "/", pattern)
+                for pattern in excludes
+            ):
+                dirs.remove(name)
+            elif path.is_symlink():
+                skipped[relative] = "symlink"
+                dirs.remove(name)
+        for name in files:
+            path = Path(directory) / name
+            relative = path.relative_to(root).as_posix()
+            if any(fnmatch.fnmatch(relative, pattern) for pattern in excludes):
+                continue
+            if path.is_symlink():
+                skipped[relative] = "symlink"
+                continue
+            try:
+                descriptor = os.open(
+                    path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+                )
+                with os.fdopen(descriptor, "rb") as stream:
+                    initial = os.fstat(stream.fileno())
+                    size = initial.st_size
+                    if not stat.S_ISREG(initial.st_mode):
+                        skipped[relative] = "non-regular"
+                        continue
+                    if per_file is not None and size > per_file:
+                        skipped[relative] = "per-file-budget"
+                        continue
+                    if budget["remaining"] is not None and size > budget["remaining"]:
+                        skipped[relative] = "total-budget"
+                        continue
+                    content = stream.read(size)
+                    budget["read"] += len(content)
+                    if budget["remaining"] is not None:
+                        budget["remaining"] -= len(content)
+                    final = os.fstat(stream.fileno())
+                    if len(content) != size or (
+                        initial.st_size,
+                        initial.st_mtime_ns,
+                        initial.st_ctime_ns,
+                    ) != (final.st_size, final.st_mtime_ns, final.st_ctime_ns):
+                        skipped[relative] = "changed-during-read"
+                    else:
+                        result[relative] = content
+            except OSError:
+                skipped[relative] = "unreadable-file"
+    return result, skipped
 
 
 def _text_changes(before: bytes, after: bytes) -> tuple[int, int] | None:
@@ -53,20 +112,54 @@ def _text_changes(before: bytes, after: bytes) -> tuple[int, int] | None:
 
 
 def compare(
-    before_root: Path, after_root: Path, excludes: list[str] | None = None
+    before_root: Path,
+    after_root: Path,
+    excludes: list[str] | None = None,
+    *,
+    max_file_bytes: int | None = None,
+    max_total_bytes: int | None = None,
 ) -> dict[str, Any]:
     patterns = [*DEFAULT_EXCLUDES, *(excludes or [])]
-    before = _inventory(before_root, patterns)
-    after = _inventory(after_root, patterns)
+    for limit in (max_file_bytes, max_total_bytes):
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError("read budgets must be non-negative integers or None (unlimited)")
+    budget = {"remaining": max_total_bytes, "read": 0}
+    before, before_skipped = _inventory(before_root, patterns, max_file_bytes, budget)
+    before_read = budget["read"]
+    after, after_skipped = _inventory(after_root, patterns, max_file_bytes, budget)
+    unverified = [
+        {"side": side, "path": path, "reason": reason}
+        for side, skipped in (("before", before_skipped), ("after", after_skipped))
+        for path, reason in sorted(skipped.items())
+    ]
     before_names, after_names = set(before), set(after)
     deleted, added = before_names - after_names, after_names - before_names
+    # Incomplete enumeration/read coverage cannot prove absence or an exact rename.
+    safe_deleted, safe_added = set(), set()
+    for side, names, content, own_skipped, other_skipped, safe in (
+        ("before", deleted, before, before_skipped, after_skipped, safe_deleted),
+        ("after", added, after, after_skipped, before_skipped, safe_added),
+    ):
+        for name in sorted(names):
+            if (
+                before_skipped
+                or after_skipped
+                or name in own_skipped
+                or _text_changes(content[name], content[name]) is None
+            ):
+                unverified.append(
+                    {"side": side, "path": name, "reason": "absence-or-content-unverified"}
+                )
+            else:
+                safe.add(name)
+    deleted, added = safe_deleted, safe_added
     renamed = []
     added_by_hash: dict[str, list[str]] = {}
-    for name in added:
+    for name in sorted(added):
         added_by_hash.setdefault(_hash(after[name]), []).append(name)
     consumed_added = set()
     consumed_deleted = set()
-    for old_name in sorted(deleted):
+    for old_name in sorted(deleted) if not unverified else []:
         matches = added_by_hash.get(_hash(before[old_name]), [])
         target = next((name for name in matches if name not in consumed_added), None)
         if target:
@@ -106,6 +199,17 @@ def compare(
         "renamed": renamed,
         "modified": changes,
         "modified_extensions": dict(sorted(extensions.items())),
+        "unverified": unverified,
+        "complete": not before_skipped and not after_skipped and not unverified,
+        "read_evidence": {
+            "mode": "unlimited"
+            if max_file_bytes is None and max_total_bytes is None
+            else "bounded",
+            "max_file_bytes": max_file_bytes,
+            "max_total_bytes": max_total_bytes,
+            "before_bytes_read": before_read,
+            "after_bytes_read": budget["read"] - before_read,
+        },
     }
 
 
@@ -135,6 +239,34 @@ def render_markdown(report: dict[str, Any]) -> str:
         if report[label]:
             lines.extend(["", f"## {label.title()}", ""])
             lines.extend(f"- `{name}`" for name in report[label])
+    lines.extend(
+        [
+            "",
+            "## Read coverage",
+            "",
+            f"Complete: {report['complete']}; mode: {report['read_evidence']['mode']}.",
+            "Per-file budget: "
+            + (
+                str(report["read_evidence"]["max_file_bytes"]) + " bytes"
+                if report["read_evidence"]["max_file_bytes"] is not None
+                else "unlimited"
+            )
+            + ".",
+            "Combined budget: "
+            + (
+                str(report["read_evidence"]["max_total_bytes"]) + " bytes"
+                if report["read_evidence"]["max_total_bytes"] is not None
+                else "unlimited"
+            )
+            + ".",
+            f"Actual bytes read: before {report['read_evidence']['before_bytes_read']}; after {report['read_evidence']['after_bytes_read']}; total {report['read_evidence']['before_bytes_read'] + report['read_evidence']['after_bytes_read']}.",
+        ]
+    )
+    if report["unverified"]:
+        lines.extend(["", "## Unverified", ""])
+        lines.extend(
+            f"- {item['side']} `{item['path']}`: {item['reason']}" for item in report["unverified"]
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 

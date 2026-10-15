@@ -17,3 +17,21 @@ The comparison is read-only, skips symlinks and common generated directories, re
 The report describes observable file differences; it cannot determine which edits were made by a person, whether the original was AI-generated, or whether a change improved quality. Exact-content rename detection is hash-based. Requires Python 3.10 or newer.
 
 Part of the [Logan Pendragon Forge open-source collection](https://www.loganpendragonforge.com/open-source/). Licensed under the [MIT License](LICENSE).
+
+## Read budgets and incomplete evidence
+
+`cleanup-diff raw-generated reviewed-final --max-file-bytes 1048576 --max-total-bytes 16777216 --format json`
+limits bytes read per file and across both trees. Non-negative integers include zero;
+omitting a limit means unlimited (the legacy default). Traversal is deterministic,
+with before read first, sorted directories and files. Oversized files are skipped
+without reading; smaller later files can still fit. Exact limits include zero-byte
+files. JSON and Markdown retain budgets, actual bytes read and unverified paths.
+
+Skipped, unreadable, changed-during-read, non-regular and symlink paths are unverified.
+An incomplete inventory prevents absence and exact-rename claims; readable same-path
+files can still be compared. Binary-only added/deleted paths are unverified and do not
+become exact renames. Same-path binary modifications still retain sizes and hashes.
+Intentional exclusions define the comparison scope. A missing or symlink root rejects.
+Sources are never modified and contents never appear in reports. Filenames and hashes
+are still visible. This is a sequential observation, not an atomic filesystem snapshot;
+external changes after reading are outside its evidence.
