@@ -47,10 +47,13 @@ def _inventory(
         for name in dirs.copy():
             path = Path(directory) / name
             relative = path.relative_to(root).as_posix()
-            if path.is_symlink():
-                skipped[relative] = "symlink"
+            if any(
+                fnmatch.fnmatch(relative, pattern) or fnmatch.fnmatch(relative + "/", pattern)
+                for pattern in excludes
+            ):
                 dirs.remove(name)
-            elif any(fnmatch.fnmatch(relative + "/", pattern) for pattern in excludes):
+            elif path.is_symlink():
+                skipped[relative] = "symlink"
                 dirs.remove(name)
         for name in files:
             path = Path(directory) / name
@@ -242,6 +245,21 @@ def render_markdown(report: dict[str, Any]) -> str:
             "## Read coverage",
             "",
             f"Complete: {report['complete']}; mode: {report['read_evidence']['mode']}.",
+            "Per-file budget: "
+            + (
+                str(report["read_evidence"]["max_file_bytes"]) + " bytes"
+                if report["read_evidence"]["max_file_bytes"] is not None
+                else "unlimited"
+            )
+            + ".",
+            "Combined budget: "
+            + (
+                str(report["read_evidence"]["max_total_bytes"]) + " bytes"
+                if report["read_evidence"]["max_total_bytes"] is not None
+                else "unlimited"
+            )
+            + ".",
+            f"Actual bytes read: before {report['read_evidence']['before_bytes_read']}; after {report['read_evidence']['after_bytes_read']}; total {report['read_evidence']['before_bytes_read'] + report['read_evidence']['after_bytes_read']}.",
         ]
     )
     if report["unverified"]:

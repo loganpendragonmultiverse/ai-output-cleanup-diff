@@ -188,3 +188,44 @@ def test_successful_markdown_output_contains_no_content(tmp_path):
     assert main([str(before), str(after), "--output", str(output)]) == 0
     assert "PRIVATE-SENTINEL" not in output.read_text()
     assert "Read coverage" in output.read_text()
+
+
+@pytest.mark.parametrize(
+    "name, exclusions", [("dist", []), ("ignored", ["ignored/**"]), ("ignored", ["ignored"])]
+)
+def test_excluded_directory_symlinks_do_not_poison_rename_evidence(tmp_path, name, exclusions):
+    before, after = trees(tmp_path)
+    (before / "old.txt").write_text("same")
+    (after / "new.txt").write_text("same")
+    target = tmp_path / "excluded-target"
+    target.mkdir()
+    (target / "private.txt").write_text("PRIVATE-CONTENT")
+    try:
+        (after / name).symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+    report = compare(before, after, exclusions, max_file_bytes=4, max_total_bytes=8)
+    assert report["complete"] is True
+    assert report["unverified"] == []
+    assert report["renamed"] == [{"from": "old.txt", "to": "new.txt", "bytes": 4}]
+    assert report["counts"] == {"added": 0, "deleted": 0, "renamed": 1, "modified": 0}
+    assert json.loads(render_json(report)) == report
+    markdown = render_markdown(report)
+    assert "Per-file budget: 4 bytes." in markdown
+    assert "Combined budget: 8 bytes." in markdown
+    assert "Actual bytes read: before 4; after 4; total 8." in markdown
+    assert "PRIVATE-CONTENT" not in render_json(report) + markdown
+    # Round-trip the exclusion on both sides as well.
+    (before / name).symlink_to(target, target_is_directory=True)
+    assert compare(before, after, exclusions)["renamed"] == report["renamed"]
+
+
+def test_markdown_zero_and_unlimited_budgets_are_explicit(tmp_path):
+    before, after = trees(tmp_path)
+    unlimited = render_markdown(compare(before, after))
+    assert "Per-file budget: unlimited." in unlimited
+    assert "Combined budget: unlimited." in unlimited
+    zero = render_markdown(compare(before, after, max_file_bytes=0, max_total_bytes=0))
+    assert "Per-file budget: 0 bytes." in zero
+    assert "Combined budget: 0 bytes." in zero
+    assert "Actual bytes read: before 0; after 0; total 0." in zero
