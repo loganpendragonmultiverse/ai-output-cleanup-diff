@@ -24,8 +24,9 @@ Part of the [Logan Pendragon Forge open-source collection](https://www.loganpend
 limits bytes read per file and across both trees. Non-negative integers include zero;
 omitting a limit means unlimited (the legacy default). Traversal is deterministic,
 with before read first, sorted directories and files. Oversized files are skipped
-without reading; smaller later files can still fit. Exact limits include zero-byte
-files. JSON and Markdown retain budgets, actual bytes read and unverified paths.
+without reading; smaller later files can still fit. Verification requires observed EOF.
+Exact budget exhaustion remains unverified, including zero-byte budgets; leave at
+least one byte of allowance for an EOF read (which consumes zero content bytes). JSON and Markdown retain budgets, actual bytes read and unverified paths.
 
 Skipped, unreadable, changed-during-read, non-regular and symlink paths are unverified.
 An incomplete inventory prevents absence and exact-rename claims; readable same-path
@@ -35,3 +36,10 @@ Intentional exclusions define the comparison scope. A missing or symlink root re
 Sources are never modified and contents never appear in reports. Filenames and hashes
 are still visible. This is a sequential observation, not an atomic filesystem snapshot;
 external changes after reading are outside its evidence.
+
+Reports require a new destination and protect ordinary existing files, dangling
+symlinks and concurrent regular-file creation using an explicit guard and exclusive
+creation. This is not protection against hostile concurrent filesystem mutation.
+See [DEVELOPMENT.md](DEVELOPMENT.md) and [TESTING.md](TESTING.md).
+
+Exit statuses: 0 complete comparison, 1 incomplete/unverified evidence, 2 invalid input or output failure. Selected root symlinks are refused; ordinary ancestor path aliases are allowed. Descendant links are skipped and unverified. Direct API exclusions must be a list of strings. Markdown filenames use variable-length code delimiters and visible control-character escapes.

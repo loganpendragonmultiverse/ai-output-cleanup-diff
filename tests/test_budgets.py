@@ -20,7 +20,7 @@ def test_exact_boundaries_and_total_exhaustion(tmp_path):
     for root in (before, after):
         (root / "a.txt").write_bytes(b"1234")
         (root / "zero.txt").write_bytes(b"")
-    report = compare(before, after, max_file_bytes=4, max_total_bytes=8)
+    report = compare(before, after, max_file_bytes=5, max_total_bytes=9)
     assert report["complete"] is True
     assert report["read_evidence"]["before_bytes_read"] == 4
     assert report["read_evidence"]["after_bytes_read"] == 4
@@ -43,7 +43,7 @@ def test_skipped_file_never_becomes_a_deletion_or_rename(tmp_path):
     assert report["complete"] is False
     assert "PRIVATE-CONTENT" not in render_json(report) + render_markdown(report)
     assert (before / "old.txt").read_text() == "PRIVATE-CONTENT"
-    assert compare(before, after, max_file_bytes=15)["counts"]["renamed"] == 1
+    assert compare(before, after, max_file_bytes=16)["counts"]["renamed"] == 1
 
 
 def test_binary_only_absence_and_renames_are_unverified(tmp_path):
@@ -113,7 +113,8 @@ def test_small_later_files_and_zero_budget(tmp_path):
     )
     zero = compare(before, after, max_file_bytes=0, max_total_bytes=0)
     assert zero["read_evidence"]["before_bytes_read"] == 0
-    assert all(x["path"] != "c-zero" for x in zero["unverified"])
+    assert not zero["complete"]
+    assert any(x["path"] == "c-zero" for x in zero["unverified"])
 
 
 @pytest.mark.parametrize("limit", [-1, True, 1.5, "4"])
@@ -128,7 +129,7 @@ def test_invalid_limits_reject(tmp_path, limit):
 def test_cli_reports_coverage_and_rejects_invalid_budget(tmp_path, capsys):
     before, after = trees(tmp_path)
     (before / "a").write_text("secret")
-    assert main([str(before), str(after), "--max-total-bytes", "0", "--format", "json"]) == 0
+    assert main([str(before), str(after), "--max-total-bytes", "0", "--format", "json"]) == 1
     report = json.loads(capsys.readouterr().out)
     assert not report["complete"]
     assert "secret" not in json.dumps(report)
@@ -204,15 +205,15 @@ def test_excluded_directory_symlinks_do_not_poison_rename_evidence(tmp_path, nam
         (after / name).symlink_to(target, target_is_directory=True)
     except OSError:
         pytest.skip("directory symlinks unavailable")
-    report = compare(before, after, exclusions, max_file_bytes=4, max_total_bytes=8)
+    report = compare(before, after, exclusions, max_file_bytes=5, max_total_bytes=9)
     assert report["complete"] is True
     assert report["unverified"] == []
     assert report["renamed"] == [{"from": "old.txt", "to": "new.txt", "bytes": 4}]
     assert report["counts"] == {"added": 0, "deleted": 0, "renamed": 1, "modified": 0}
     assert json.loads(render_json(report)) == report
     markdown = render_markdown(report)
-    assert "Per-file budget: 4 bytes." in markdown
-    assert "Combined budget: 8 bytes." in markdown
+    assert "Per-file budget: 5 bytes." in markdown
+    assert "Combined budget: 9 bytes." in markdown
     assert "Actual bytes read: before 4; after 4; total 8." in markdown
     assert "PRIVATE-CONTENT" not in render_json(report) + markdown
     # Round-trip the exclusion on both sides as well.

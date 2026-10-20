@@ -4,6 +4,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 import stat
 from collections import Counter
 from difflib import ndiff
@@ -79,12 +80,35 @@ def _inventory(
                     if budget["remaining"] is not None and size > budget["remaining"]:
                         skipped[relative] = "total-budget"
                         continue
-                    content = stream.read(size)
-                    budget["read"] += len(content)
-                    if budget["remaining"] is not None:
-                        budget["remaining"] -= len(content)
+                    chunks = []
+                    consumed = 0
+                    exhausted = None
+                    while True:
+                        allowance = 1024 * 1024
+                        if per_file is not None:
+                            allowance = min(allowance, per_file - consumed)
+                        if budget["remaining"] is not None:
+                            allowance = min(allowance, budget["remaining"])
+                        if allowance == 0:
+                            exhausted = (
+                                "per-file-budget"
+                                if per_file is not None and consumed == per_file
+                                else "total-budget"
+                            )
+                            break
+                        chunk = stream.read(allowance)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        consumed += len(chunk)
+                        budget["read"] += len(chunk)
+                        if budget["remaining"] is not None:
+                            budget["remaining"] -= len(chunk)
+                    content = b"".join(chunks)
                     final = os.fstat(stream.fileno())
-                    if len(content) != size or (
+                    if exhausted:
+                        skipped[relative] = exhausted
+                    elif len(content) != size or (
                         initial.st_size,
                         initial.st_mtime_ns,
                         initial.st_ctime_ns,
@@ -119,6 +143,10 @@ def compare(
     max_file_bytes: int | None = None,
     max_total_bytes: int | None = None,
 ) -> dict[str, Any]:
+    if excludes is not None and (
+        not isinstance(excludes, list) or any(not isinstance(x, str) for x in excludes)
+    ):
+        raise ValueError("excludes must be a list of strings or None")
     patterns = [*DEFAULT_EXCLUDES, *(excludes or [])]
     for limit in (max_file_bytes, max_total_bytes):
         if limit is not None and (type(limit) is not int or limit < 0):
@@ -213,6 +241,14 @@ def compare(
     }
 
 
+def _filename(value: str) -> str:
+    literal = "".join(
+        f"\\u{ord(char):04x}" if ord(char) < 32 or ord(char) == 127 else char for char in value
+    )
+    fence = "`" * (max((len(x) for x in re.findall(r"`+", literal)), default=0) + 1)
+    return fence + " " + literal + " " + fence
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     counts = report["counts"]
     lines = [
@@ -230,15 +266,17 @@ def render_markdown(report: dict[str, Any]) -> str:
                 else "binary content changed"
             )
             lines.append(
-                f"- `{item['path']}` — {detail}; {item['before_bytes']} → {item['after_bytes']} bytes"
+                f"- {_filename(item['path'])} — {detail}; {item['before_bytes']} → {item['after_bytes']} bytes"
             )
     if report["renamed"]:
         lines.extend(["", "## Exact-content renames", ""])
-        lines.extend(f"- `{item['from']}` → `{item['to']}`" for item in report["renamed"])
+        lines.extend(
+            f"- {_filename(item['from'])} → {_filename(item['to'])}" for item in report["renamed"]
+        )
     for label in ("added", "deleted"):
         if report[label]:
             lines.extend(["", f"## {label.title()}", ""])
-            lines.extend(f"- `{name}`" for name in report[label])
+            lines.extend(f"- {_filename(name)}" for name in report[label])
     lines.extend(
         [
             "",
@@ -265,7 +303,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     if report["unverified"]:
         lines.extend(["", "## Unverified", ""])
         lines.extend(
-            f"- {item['side']} `{item['path']}`: {item['reason']}" for item in report["unverified"]
+            f"- {item['side']} {_filename(item['path'])}: {item['reason']}"
+            for item in report["unverified"]
         )
     return "\n".join(lines).rstrip() + "\n"
 
